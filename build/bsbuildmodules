@@ -1,0 +1,201 @@
+#!/bin/bash
+
+usage()
+{
+cat << EOF
+usage: $0 [-n] -k kernel -d dist
+
+This script build packages against specific kernel.
+
+OPTIONS:
+   -a arch	Build for specific arch only - default "x86_64 i686"
+   -c           Do not run mash before executing
+   -d dist      Distribution - slc5 slc6
+   -e opts      Extra mock options - eg "--define 'dist .cern'" 
+   -h           Show this message
+   -k kernel    Kernel version e.g: 2.6.18-308.13.1.el5
+   -n           Dry-run - Only show what will be built
+   -p path      Build one package
+   -g           Only generate mock config for the specified kernel
+EOF
+}
+
+EXTRA_OPTS_CMD=""
+TODAY=`date +%Y%m%d%H%M%S`
+BASE="/mnt/data2/home/build/modules"
+CONF="$BASE/configs"
+INCOMING="$BASE/incoming"
+LOGS="$BASE/logs"
+ARCHES="x86_64 i686"
+DIST=""
+KERNEL=""
+DRYRUN=""
+CACHE=""
+CONFIGONLY=""
+VERBOSE=0
+
+while getopts “:hcnga:e:k:d:p:” OPTION
+do
+        case $OPTION in
+         h)
+             usage
+             exit 1
+             ;;
+         c)
+             CACHE=1
+             ;;
+         n)
+             DRYRUN=1
+             ;;
+         g)
+             CONFIGONLY=1
+             ;;
+         k)
+             KERNEL=$OPTARG
+             if [[ $KERNEL =~ ^[0-9].* ]]
+	     then
+		echo "Valid kernel string"
+	     else
+		echo "Invalid kernel string, not starting with a number"
+		exit 1
+	     fi
+             ;;
+         a)
+             ARCHES=$OPTARG
+             ;;
+         d)
+             DIST=$OPTARG
+             ;;
+         e)
+             EXTRA_OPTS_CMD=$OPTARG
+             ;;
+         p)
+	     ONEPKG=$(readlink -f $OPTARG)
+             ;;
+         ?)
+             exit 1
+             ;;
+         :)
+	     echo "Option -$OPTARG requires an argument."
+	     exit 1
+	     ;;
+        esac
+done
+
+shift $(($OPTIND - 1)) 
+
+if [[ -z $KERNEL ]] || [[ -z $DIST ]]
+then
+     usage
+     exit 1
+fi
+
+# Check if DIST has config
+if [ ! -f $CONF/$DIST-x86_64-template.cfg ] || [ ! -f $CONF/$DIST-x86_64-template.cfg ]
+then
+	echo "No configs found"
+	echo "$DIST-x86_64-template.cfg and $DIST-x86_64-template.cfg must be created first"
+	exit 1
+fi
+
+# List available packages
+PKGS=`find $INCOMING/$DIST -name "*src.rpm" 2> /dev/null`
+if [ "x$PKGS" == "x" ] 
+then
+	echo "Nothing to build"
+	exit 1
+fi
+if [ $ONEPKG ]
+then
+	PKGS=$ONEPKG
+fi
+
+echo ""
+echo "### SUMMARY ###"
+echo "# KERNEL : $KERNEL"
+echo "# DIST   : $DIST  "
+echo "# PACKAGES TO BUILD :"
+echo "$PKGS"
+echo "### END     ###"
+echo ""
+
+# Exit if dryrun
+if [ $DRYRUN ]
+then
+	exit 1
+fi
+
+if [ ! $CACHE ]
+then
+	echo "Regenerating koji $DIST repository..."
+    		/usr/bin/mash -c /mnt/data2/etc/mash/mash.conf $DIST-testing-updates -o /mnt/data2/koji/mash/repo -p /mnt/data2/koji/mash/repo >& $LOGS/mash.log
+	echo "Repository OK"
+	echo ""
+	echo "Cleaning cache..."
+	rm -rf /var/cache/mock/sl* &> /dev/null
+fi
+
+START=`date`
+
+# Generate configs for specific kernel
+if [ ! -f $CONF/$DIST-i686-$KERNEL.cfg ] 
+then 
+	cp $CONF/$DIST-i686-template.cfg $CONF/$DIST-i686-$KERNEL.cfg
+	sed -i "s/XXX/$KERNEL/g" $CONF/$DIST-i686-$KERNEL.cfg
+	cp $CONF/$DIST-i686-$KERNEL.cfg $CONF/$DIST-i386-$KERNEL.cfg
+	echo "wrote $CONF/$DIST-i686-$KERNEL.cfg" 
+	echo "wrote $CONF/$DIST-i386-$KERNEL.cfg" 
+fi
+if [ ! -f $CONF/$DIST-x86_64-$KERNEL.cfg ] 
+then
+	cp $CONF/$DIST-x86_64-template.cfg $CONF/$DIST-x86_64-$KERNEL.cfg
+	sed -i "s/XXX/$KERNEL/g" $CONF/$DIST-x86_64-$KERNEL.cfg
+	echo "wrote $CONF/$DIST-x86_64-$KERNEL.cfg"
+fi
+
+if [ $CONFIGONLY ]
+then
+        exit 1
+fi
+
+
+for ARCH in $ARCHES 
+do
+	for PKG in $PKGS
+	do 
+		CMD="mock --define 'vendor Scientific Linux CERN, http://cern.ch/linux' --define 'packager CERN Linux Support <linux.support@cern.ch>'"
+		EXTRA_OPTS=""
+		EXCLUSIVEARCH=$ARCH
+		SRPM=`basename $PKG`
+		[ -f $CONF/extra/$SRPM.mock ] && source $CONF/extra/$SRPM.mock 
+		[ -f $CONF/extra/$SRPM.$ARCH.mock ] && source $CONF/extra/$SRPM.$ARCH.mock 
+		if [ "x$EXCLUSIVEARCH" != "x$ARCH" ]
+		then
+			echo "Arch not supported. Continuing..."
+			break
+		fi
+		CMD="$CMD $EXTRA_OPTS $EXTRA_OPTS_CMD"
+		echo ""
+		echo "Building: $SRPM on $ARCH with : $CMD --resultdir=$BASE/results/$DIST/$KERNEL/$ARCH/$SRPM -r $DIST-$ARCH-$KERNEL --configdir=$CONF --rebuild $PKG $EXTRA_OPTS --target $ARCH >& $LOGS/$ARCH/mock-$KERNEL-$SRPM.log"
+		(eval ${CMD} --resultdir=$BASE/results/$DIST/$KERNEL/$ARCH/$SRPM -r $DIST-$ARCH-$KERNEL --configdir=$CONF --rebuild $PKG $EXTRA_OPTS --target $ARCH) >& $LOGS/$ARCH/mock-$KERNEL-$SRPM.log 
+		STATUS=`grep ERROR $LOGS/$ARCH/mock-$KERNEL-$SRPM.log`
+		if [ "x$STATUS" != "x" ] 
+		then
+			echo "$TODAY:$SRPM:$KERNEL:$ARCH:ERROR" >> $LOGS/summary.log
+		else
+			echo "$TODAY:$SRPM:$KERNEL:$ARCH:SUCCESS" >> $LOGS/summary.log
+		fi
+	done &
+done
+
+echo ""
+sleep 4s
+echo ""
+echo "Waiting... ( You can press Control-C )"
+echo "PID:"
+echo "`jobs -p`"
+wait
+echo "Finished at `date` (was started at $START)"
+echo ""
+echo "Check logs in $LOGS"
+cat $LOGS/summary.log | grep $TODAY
